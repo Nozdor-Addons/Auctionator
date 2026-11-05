@@ -3,6 +3,10 @@ name: Send repo archive to Discord on push
 on:
   push:
     branches: ["main"]
+    # Эти файлы в архив не входят: правка только их - не новая версия для игроков.
+    paths-ignore:
+      - ".github/**"
+      - "README.md"
   workflow_dispatch: {}
 
 permissions:
@@ -16,6 +20,15 @@ jobs:
   zip-and-send:
     runs-on: ubuntu-latest
     steps:
+      - name: Check Discord webhook secret
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_AUCTIONATOR }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::error::Secret DISCORD_WEBHOOK_AUCTIONATOR is not set (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -42,26 +55,42 @@ jobs:
             echo "small=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Build Discord message
+        shell: bash
+        env:
+          # Текст коммитов - через окружение: кавычки и апострофы в нём не ломают скрипт.
+          COMMIT_MESSAGES: ${{ toJson(github.event.commits.*.message) }}
+          SMALL: ${{ steps.make_zip.outputs.small }}
+        run: |
+          # Ручной запуск (workflow_dispatch) приходит без списка коммитов - берём последний.
+          HEAD_MESSAGE="$(git log -1 --format=%B)"
+
+          # Большой архив уходит в релиз, в сообщении - ссылка на него.
+          TAIL=""
+          if [ "$SMALL" != "true" ]; then
+            TAIL=$'\n\n'"Архив: https://github.com/${GITHUB_REPOSITORY}/releases/tag/auto-${GITHUB_REF_NAME}-${GITHUB_SHA}"
+          fi
+
+          # Discord принимает не больше 2000 символов: режем текст коммитов, ссылку не трогаем.
+          jq -n \
+            --arg repo "${GITHUB_REPOSITORY#*/}" \
+            --argjson messages "${COMMIT_MESSAGES:-null}" \
+            --arg head "$HEAD_MESSAGE" \
+            --arg tail "$TAIL" '
+            (($messages // []) | if length > 0 then . else [$head] end)
+            | map(gsub("\r\n?"; "\n") | split("\n") | map(select(. != "")) | join("\n") | select(. != ""))
+            | ($repo + "\n" + join("\n")) as $text
+            | (2000 - ($tail | length)) as $room
+            | {content: ((if ($text | length) > $room then $text[0:($room - 3)] + "..." else $text end) + $tail)}
+          ' > payload.json
+
       - name: Send to Discord (attach)
         if: steps.make_zip.outputs.small == 'true'
         env:
           WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_AUCTIONATOR }}
         run: |
-          REPO_NAME='${{ github.event.repository.name }}'
-          COMMITS_JSON='${{ toJson(github.event.commits) }}'
-          PAYLOAD=$(jq -n --arg repo "$REPO_NAME" --argjson commits "$COMMITS_JSON" '
-            {content: ($repo + "\n" + (
-            [$commits[].message
-              | gsub("\r\n"; "\n")
-              | gsub("\r"; "\n")
-              | (split("\n") | map(select(. != "")) | join("\n"))
-              | gsub("\n+$"; "")
-              | select(. != "")
-            ] | join("\n")))}
-          ')
-
-          curl -s -X POST \
-            -F "payload_json=$PAYLOAD" \
+          curl -sS --fail-with-body -X POST \
+            -F "payload_json=<payload.json" \
             -F "file=@${ZIP_NAME}" \
             "$WEBHOOK_URL"
 
@@ -94,21 +123,6 @@ jobs:
         env:
           WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_AUCTIONATOR }}
         run: |
-          REPO_NAME='${{ github.event.repository.name }}'
-          COMMITS_JSON='${{ toJson(github.event.commits) }}'
-          REL_TAG="auto-${GITHUB_REF_NAME}-${GITHUB_SHA}"
-          REL_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${REL_TAG}"
-
-          PAYLOAD=$(jq -n --arg repo "$REPO_NAME" --argjson commits "$COMMITS_JSON" --arg url "$REL_URL" '
-            {content: ($repo + "\n" + ([$commits[].message
-              | gsub("\r\n"; "\n")
-              | gsub("\r"; "\n")
-              | (split("\n") | map(select(. != "")) | join("\n"))
-              | gsub("\n+$"; "")
-              | select(. != "")
-            ] | join("\n")) + "\n\n" + "Архив: " + $url)}
-          ')
-
-          curl -s -H "Content-Type: application/json" \
-            -d "$PAYLOAD" \
+          curl -sS --fail-with-body -H "Content-Type: application/json" \
+            --data-binary @payload.json \
             "$WEBHOOK_URL"
