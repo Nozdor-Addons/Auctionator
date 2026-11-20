@@ -36,3 +36,5 @@ AuctionatorNozdor.lua
 
 AuctionatorConfig.xml
 
+AuctionatorBagSell.lua
+
