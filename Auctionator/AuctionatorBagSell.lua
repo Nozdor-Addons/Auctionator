@@ -131,7 +131,8 @@ local stackPriceInput
 local summaryText
 local postButton
 local selectedDuration = 24
-local updatingMoney = false
+local moneyUpdateDepth = 0
+local postingInProgress = false
 
 local selectedEntry
 local selectedRows = {}
@@ -148,6 +149,7 @@ local showItemHookInstalled = false
 local recommendHookInstalled = false
 local showElemsHookInstalled = false
 local updateUIHookInstalled = false
+local paneHookInstalled = false
 
 local function GetContentBase()
   return _G.AuctionHouseFrame or _G.Atr_Main_Panel or _G.Atr_SellControls or UIParent
@@ -329,6 +331,53 @@ local function Say(message)
   end
 end
 
+local OriginalGetAuctionItemInfo = _G.GetAuctionItemInfo
+
+local function GetOwnedAuctionItemInfo(index)
+  if not (C_AuctionHouse and C_AuctionHouse.GetOwnedAuctionInfo) then
+    return nil
+  end
+  local ok, info = pcall(C_AuctionHouse.GetOwnedAuctionInfo, index)
+  if not ok or not info then
+    return nil
+  end
+
+  local link = info.itemLink
+  local itemID = info.itemKey and info.itemKey.itemID
+  if not link and itemID then
+    link = "item:" .. itemID
+  end
+  if not link then
+    return nil
+  end
+
+  local name, _, quality, itemLevel, _, _, _, _, _, texture = GetItemInfo(link)
+  if not name then
+    return nil
+  end
+
+  local count = info.quantity or 0
+  if count <= 0 then
+    return nil
+  end
+
+  local bid = info.bidAmount or 0
+  local buyout = info.buyoutAmount or bid
+  return name, texture, count, quality, true, itemLevel or 0, bid, 0, buyout, bid, info.bidder,
+    info.owner or UnitName("player"), nil
+end
+
+if OriginalGetAuctionItemInfo then
+  _G.GetAuctionItemInfo = function(listType, index)
+    local name, texture, count, quality, canUse, level, minBid, minIncrement, buyoutPrice, bidAmount, highBidder, owner =
+      OriginalGetAuctionItemInfo(listType, index)
+    if name ~= nil or listType ~= "owner" then
+      return name, texture, count, quality, canUse, level, minBid, minIncrement, buyoutPrice, bidAmount, highBidder, owner
+    end
+    return GetOwnedAuctionItemInfo(index)
+  end
+end
+
 local function After(delay, func)
   if C_Timer and C_Timer.After then
     C_Timer.After(delay, func)
@@ -454,6 +503,23 @@ local function GetDeposit(entry, quantity)
   return total
 end
 
+local function RefreshOwnedAuctions()
+  if C_AuctionHouse and C_AuctionHouse.QueryOwnedAuctions then
+    pcall(C_AuctionHouse.QueryOwnedAuctions, {})
+  end
+  local function update()
+    if Atr_OnAuctionOwnedUpdate then
+      pcall(Atr_OnAuctionOwnedUpdate)
+    end
+    if Atr_IsModeActiveAuctions and Atr_IsModeActiveAuctions() and Atr_DisplayHlist then
+      pcall(Atr_DisplayHlist)
+    end
+  end
+  After(0.5, update)
+  After(1.5, update)
+  After(3.0, update)
+end
+
 local function UpdateTotals()
   local quantity = GetQuantity()
   local unitPrice = GetUnitPrice()
@@ -464,7 +530,8 @@ local function UpdateTotals()
   end
 
   if postButton then
-    local canPost = selectedEntry ~= nil
+    local canPost = not postingInProgress
+      and selectedEntry ~= nil
       and quantity > 0
       and unitPrice > 0
     postButton:SetEnabled(canPost)
@@ -475,9 +542,11 @@ local function SetMoney(frame, copper)
   if not frame then
     return
   end
-  updatingMoney = true
+  moneyUpdateDepth = moneyUpdateDepth + 1
   MoneyInputFrame_SetCopper(frame, copper or 0)
-  updatingMoney = false
+  After(0.05, function()
+    moneyUpdateDepth = math.max(0, moneyUpdateDepth - 1)
+  end)
 end
 
 local function SetSuggestedPrice(unitPrice)
@@ -683,6 +752,9 @@ local function PostSelected()
   if qtyBox then
     qtyBox:ClearFocus()
   end
+  if postingInProgress then
+    return
+  end
   if not selectedEntry then
     Say(L.noItem)
     return
@@ -711,57 +783,171 @@ local function PostSelected()
   end
 
   local duration = GetDurationEnum()
-  local failure
+  local entryAtStart = selectedEntry
 
-  local locations = selectedEntry.locations
-  if not locations and selectedEntry.location then
-    locations = { { location = selectedEntry.location, count = selectedEntry.count } }
+  local source = entryAtStart.locations
+  if not source and entryAtStart.location then
+    source = { { location = entryAtStart.location, count = entryAtStart.count } }
   end
-  if not locations or #locations == 0 then
+  if not source or #source == 0 then
     Say(L.postError)
     return
   end
 
-  local commodity = IsCommodity(selectedEntry)
+  local commodity = IsCommodity(entryAtStart)
   if commodity and not C_AuctionHouse.PostCommodity then
     Say(L.postError)
     return
   end
-
-  local remaining = quantity
-  for _, info in ipairs(locations) do
-    if remaining <= 0 then
-      break
-    end
-    local count = math.min(remaining, info.count or 0)
-    if count > 0 and info.location then
-      local ok, err
-      if commodity then
-        ok, err = pcall(C_AuctionHouse.PostCommodity, info.location, duration, count, unitPrice)
-      else
-        ok, err = pcall(C_AuctionHouse.PostItem, info.location, duration, count, nil, unitPrice * count)
-      end
-      if not ok then
-        failure = err
-        break
-      end
-      remaining = remaining - count
-    end
-  end
-  if not failure and remaining > 0 then
-    failure = "not enough items"
-  end
-
-  if failure then
-    Say(L.postError .. ": " .. tostring(failure))
+  if not commodity and not C_AuctionHouse.PostItem then
+    Say(L.postError)
     return
   end
 
-  After(0.5, function()
-    if Atr_BagSell_Refresh then
-      Atr_BagSell_Refresh()
+  local locations = {}
+  for _, info in ipairs(source) do
+    if info.location and (info.count or 0) > 0 then
+      locations[#locations + 1] = {
+        location = info.location,
+        count = info.count,
+        retries = 0,
+      }
     end
-  end)
+  end
+  if #locations == 0 then
+    Say(L.postError)
+    return
+  end
+
+  local function IsReadyToPost()
+    if C_AuctionHouse.IsThrottledMessageSystemReady then
+      local ok, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
+      if ok then
+        return ready and true or false
+      end
+    end
+    return true
+  end
+
+  local function GetAvailable(info)
+    local count = info.count or 0
+    if C_AuctionHouse.GetAvailablePostCount then
+      local ok, available = pcall(C_AuctionHouse.GetAvailablePostCount, info.location)
+      if ok and type(available) == "number" then
+        count = math.min(count, available)
+      end
+    end
+    return count
+  end
+
+  postingInProgress = true
+  UpdateTotals()
+
+  local remaining = quantity
+  local index = 1
+
+  local function Finish()
+    postingInProgress = false
+    UpdateTotals()
+    After(0.5, function()
+      if Atr_BagSell_Refresh then
+        Atr_BagSell_Refresh()
+      end
+      RefreshOwnedAuctions()
+    end)
+  end
+
+  local function PostNext()
+    if not postingInProgress then
+      return
+    end
+    if not AuctionHouseFrame or not AuctionHouseFrame:IsShown() then
+      postingInProgress = false
+      UpdateTotals()
+      return
+    end
+    if not selectedEntry or selectedEntry.key ~= entryAtStart.key then
+      Finish()
+      return
+    end
+    if remaining <= 0 then
+      Finish()
+      return
+    end
+    if not IsReadyToPost() then
+      After(0.25, PostNext)
+      return
+    end
+
+    if commodity then
+      while index <= #locations do
+        local info = locations[index]
+        local count = math.min(remaining, GetAvailable(info))
+        if count > 0 then
+          local ok, err = pcall(C_AuctionHouse.PostCommodity, info.location, duration, count, unitPrice)
+          if not ok then
+            postingInProgress = false
+            UpdateTotals()
+            Say(L.postError .. ": " .. tostring(err))
+            return
+          end
+          remaining = remaining - count
+          if remaining <= 0 then
+            Finish()
+          else
+            index = index + 1
+            After(0.15, PostNext)
+          end
+          return
+        end
+        index = index + 1
+      end
+
+      postingInProgress = false
+      UpdateTotals()
+      Say(L.postError .. ": not enough items")
+      return
+    end
+
+    while index <= #locations do
+      local info = locations[index]
+      local count = GetAvailable(info)
+      if count > 0 then
+        local postCount = math.min(remaining, count)
+        local ok, err = pcall(C_AuctionHouse.PostItem, info.location, duration, postCount, nil, unitPrice * postCount)
+        if not ok then
+          postingInProgress = false
+          UpdateTotals()
+          Say(L.postError .. ": " .. tostring(err))
+          return
+        end
+        remaining = remaining - postCount
+        info.count = (info.count or 0) - postCount
+        if info.count <= 0 then
+          index = index + 1
+        end
+        if remaining <= 0 then
+          Finish()
+        else
+          After(0.15, PostNext)
+        end
+        return
+      end
+
+      info.retries = (info.retries or 0) + 1
+      if info.retries < 10 then
+        After(0.3, PostNext)
+        return
+      end
+      index = index + 1
+    end
+
+    postingInProgress = false
+    UpdateTotals()
+    Say(L.postError .. ": not enough items")
+  end
+
+  PostNext()
 end
 
 local function GetBagSlots(bag)
@@ -1283,7 +1469,7 @@ local function BuildHeaderPanel()
   MoneyInputFrame_SetCopper(stackPriceInput, 0)
   if MoneyInputFrame_SetOnValueChangedFunc then
     MoneyInputFrame_SetOnValueChangedFunc(stackPriceInput, function()
-      if updatingMoney then
+      if moneyUpdateDepth > 0 then
         return
       end
       priceDirty = true
@@ -1304,7 +1490,7 @@ local function BuildHeaderPanel()
   MoneyInputFrame_SetCopper(priceInput, 0)
   if MoneyInputFrame_SetOnValueChangedFunc then
     MoneyInputFrame_SetOnValueChangedFunc(priceInput, function()
-      if updatingMoney then
+      if moneyUpdateDepth > 0 then
         return
       end
       priceDirty = true
@@ -1406,11 +1592,20 @@ local function EnsureFrames()
     end)
   end
 
-  if Atr_StackPriceChangedFunc and not stackPriceHookInstalled then
+  if Atr_EntryOnClick and not stackPriceHookInstalled then
     stackPriceHookInstalled = true
     pcall(function()
-      hooksecurefunc("Atr_StackPriceChangedFunc", function()
-        if frame and frame:IsShown() and selectedEntry and not priceDirty then
+      hooksecurefunc("Atr_EntryOnClick", function()
+        if not (frame and frame:IsShown() and selectedEntry) then
+          return
+        end
+        if Atr_IsTabSelected and not Atr_IsTabSelected(SELL_TAB_INDEX) then
+          return
+        end
+        After(0.05, function()
+          if not selectedEntry or not _G.Atr_StackPrice then
+            return
+          end
           local copper = MoneyInputFrame_GetCopper(_G.Atr_StackPrice)
           local stackSize = Atr_StackSize and Atr_StackSize() or 1
           if stackSize and stackSize > 0 and copper and copper > 0 then
@@ -1421,7 +1616,7 @@ local function EnsureFrames()
               UpdateTotals()
             end
           end
-        end
+        end)
       end)
     end)
   end
@@ -1461,6 +1656,16 @@ local function EnsureFrames()
       hooksecurefunc("Atr_UpdateUI_SellPane", function()
         if frame and frame:IsShown() then
           ApplyHeaderLayout()
+        end
+      end)
+    end)
+  end
+  if Atr_SelectPane and not paneHookInstalled then
+    paneHookInstalled = true
+    pcall(function()
+      hooksecurefunc("Atr_SelectPane", function(whichTab)
+        if whichTab == 2 then
+          RefreshOwnedAuctions()
         end
       end)
     end)
@@ -1583,8 +1788,10 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
     After(1.0, DefaultToSellOnce)
     After(2.0, DefaultToSellOnce)
     ScheduleBagRefresh()
+    After(1.0, RefreshOwnedAuctions)
   elseif event == "AUCTION_HOUSE_CLOSED" then
     pendingSellDefault = false
+    postingInProgress = false
   elseif event == "BAG_UPDATE" or event == "BAG_UPDATE_DELAYED" then
     if initialized and frame and frame:IsShown() then
       ScheduleBagRefresh()
