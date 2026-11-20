@@ -5,19 +5,20 @@ local BAG_COLUMNS = 5
 local ICON_STEP = BAG_ICON_SIZE + BAG_ICON_GAP
 
 local HEADER_LAYOUT = {
-  icon = { x = 30, y = -30, size = 50 },
+  icon = { x = 15, y = -30, size = 50 },
+  name = { x = 15, y = -6, width = 400, height = 18 },
   -- Перетащите в данную область предмет...
   message = { x = -140, y = 20, width = 520, height = 18 },
-  qtyInput = { x = 320, y = -65, width = 36 },
-  qtyMax = { x = 390, y = -65, width = 45, height = 20 },
+  qtyInput = { x = 355, y = -65, width = 36 },
+  qtyMax = { x = 420, y = -65, width = 45, height = 20 },
 
-  stackLabel = { x = 105, y = -8 },
-  stackInput = { x = 110, y = -25, width = 96 },
-  itemLabel = { x = 105, y = -49 },
-  itemInput = { x = 110, y = -65, width = 96 },
-  durationLabel = { x = 470, y = -6 },
-  duration = { x = 450, y = -20 },
-  commission = { x = 315, y = -28, width = 175 },
+  stackLabel = { x = 75, y = -36 },
+  stackInput = { x = 170, y = -30, width = 96 },
+  itemLabel = { x = 75, y = -70 },
+  itemInput = { x = 170, y = -65, width = 96 },
+  durationLabel = { x = 470, y = -10 },
+  duration = { x = 450, y = -25 },
+  commission = { x = 350, y = -36, width = 175 },
   post = { x = 465, y = -64, width = 113, height = 22 },
 }
 
@@ -28,7 +29,7 @@ if GetLocale() == "ruRU" then
     pcs = "шт.",
     max = "Макс",
     price = "Цена за штуку",
-    stackPrice = "Цена за стопку",
+    stackPrice = "Цена за все",
     duration = "Длительность",
     commission = "Комиссия",
     post = "Продать",
@@ -129,6 +130,7 @@ local qtyPcs
 local priceInput
 local stackPriceInput
 local durationDropDown
+local itemNameText
 local summaryText
 local postButton
 local selectedDuration = 24
@@ -213,6 +215,10 @@ local function ApplyHeaderLayout()
     PlaceHeaderRegion(icon, HEADER_LAYOUT.icon)
     icon:SetSize(HEADER_LAYOUT.icon.size, HEADER_LAYOUT.icon.size)
     icon:SetShown(selectedEntry ~= nil)
+  end
+
+  if itemNameText then
+    PlaceHeaderRegion(itemNameText, HEADER_LAYOUT.name)
   end
 
   if not emptySlot then
@@ -674,6 +680,23 @@ local function SendSearch(entry)
   TrySendSearch()
 end
 
+local function GetQualityColor(quality)
+  quality = tonumber(quality) or 1
+  if _G.ITEM_QUALITY_COLORS and _G.ITEM_QUALITY_COLORS[quality] then
+    local color = _G.ITEM_QUALITY_COLORS[quality]
+    if color.color then
+      local r, g, b = color.color:GetRGB()
+      return r, g, b
+    end
+    return color.r or 1, color.g or 1, color.b or 1
+  end
+  if GetItemQualityColor then
+    local r, g, b = GetItemQualityColor(quality)
+    return r or 1, g or 1, b or 1
+  end
+  return 1, 1, 1
+end
+
 local function UpdateCard()
   if not qtyBox or not priceInput then
     return
@@ -688,6 +711,10 @@ local function UpdateCard()
     if qtyPcs then
       qtyPcs:Show()
     end
+    if itemNameText then
+      itemNameText:SetText(L.noItem)
+      itemNameText:SetTextColor(0.55, 0.55, 0.55)
+    end
     SetMoney(priceInput, 0)
     SetMoney(stackPriceInput, 0)
     UpdateTotals()
@@ -701,6 +728,11 @@ local function UpdateCard()
   end
   if qtyPcs then
     qtyPcs:Show()
+  end
+  if itemNameText then
+    itemNameText:SetText(selectedEntry.name or selectedEntry.link or "")
+    local r, g, b = GetQualityColor(selectedEntry.quality)
+    itemNameText:SetTextColor(r, g, b)
   end
 
   local maxQuantity = GetMaxQuantity(selectedEntry)
@@ -970,23 +1002,6 @@ local function GetBagItem(bag, slot)
     end
   end
   return GetContainerItemInfo(bag, slot)
-end
-
-local function GetQualityColor(quality)
-  quality = tonumber(quality) or 1
-  if _G.ITEM_QUALITY_COLORS and _G.ITEM_QUALITY_COLORS[quality] then
-    local color = _G.ITEM_QUALITY_COLORS[quality]
-    if color.color then
-      local r, g, b = color.color:GetRGB()
-      return r, g, b
-    end
-    return color.r or 1, color.g or 1, color.b or 1
-  end
-  if GetItemQualityColor then
-    local r, g, b = GetItemQualityColor(quality)
-    return r or 1, g or 1, b or 1
-  end
-  return 1, 1, 1
 end
 
 local function GetItemIDFromLink(link)
@@ -1408,6 +1423,12 @@ local function BuildHeaderPanel()
     headerPanel:SetSize(595, 100)
   end
   headerPanel:SetFrameLevel((frame or itemPanel):GetFrameLevel() + 5)
+
+  itemNameText = headerPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+  itemNameText:SetJustifyH("LEFT")
+  itemNameText:SetJustifyV("MIDDLE")
+  itemNameText:SetWordWrap(false)
+  itemNameText:SetText("")
 
   qtyBox = CreateFrame("EditBox", "Atr_BagSellQuantity", headerPanel, "InputBoxTemplate")
   qtyBox:SetSize(HEADER_LAYOUT.qtyInput.width, 20)
