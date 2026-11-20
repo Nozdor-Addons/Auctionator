@@ -153,6 +153,7 @@ local recommendHookInstalled = false
 local showElemsHookInstalled = false
 local updateUIHookInstalled = false
 local paneHookInstalled = false
+local searchCompleteHookInstalled = false
 
 local function GetContentBase()
   return _G.AuctionHouseFrame or _G.Atr_Main_Panel or _G.Atr_SellControls or UIParent
@@ -501,6 +502,37 @@ local function RefreshOwnedAuctions()
   After(0.5, update)
   After(1.5, update)
   After(3.0, update)
+end
+
+local sellRefreshPending = false
+
+local function RefreshSellPriceList(entry)
+  if not entry then
+    return
+  end
+  if not (Atr_GetCurrentPane and Atr_IsTabSelected and Atr_IsTabSelected(SELL_TAB_INDEX)) then
+    return
+  end
+  if not IsAuctionThrottleReady() then
+    if not sellRefreshPending then
+      sellRefreshPending = true
+      After(0.3, function()
+        sellRefreshPending = false
+        RefreshSellPriceList(entry)
+      end)
+    end
+    return
+  end
+
+  local pane = Atr_GetCurrentPane()
+  if not pane or not pane.DoSearch then
+    return
+  end
+
+  local name = pane.activeScan and pane.activeScan.itemName or entry.name
+  if name and name ~= "" then
+    pane:DoSearch(name, true, 0)
+  end
 end
 
 local function UpdateTotals()
@@ -890,7 +922,7 @@ local function PostSelected()
       if Atr_BagSell_Refresh then
         Atr_BagSell_Refresh()
       end
-      RefreshOwnedAuctions()
+      RefreshSellPriceList(entryAtStart)
     end)
   end
 
@@ -1694,6 +1726,34 @@ local function EnsureFrames()
       hooksecurefunc("Atr_SelectPane", function(whichTab)
         if whichTab == 2 then
           RefreshOwnedAuctions()
+        end
+      end)
+    end)
+  end
+  if Atr_OnSearchComplete and not searchCompleteHookInstalled then
+    searchCompleteHookInstalled = true
+    pcall(function()
+      hooksecurefunc("Atr_OnSearchComplete", function()
+        local pane = Atr_GetCurrentPane and Atr_GetCurrentPane()
+        local scan = pane and pane.activeScan
+        if not scan or type(scan.scanData) ~= "table" then
+          return
+        end
+
+        local player = UnitName("player")
+        local changed = false
+        for _, data in ipairs(scan.scanData) do
+          if data.owner == "player" then
+            data.owner = player
+            changed = true
+          end
+        end
+
+        if changed then
+          if scan.CondenseAndSort then
+            pcall(scan.CondenseAndSort, scan)
+          end
+          pane.UINeedsUpdate = true
         end
       end)
     end)
