@@ -128,6 +128,7 @@ local qtyMaxButton
 local qtyPcs
 local priceInput
 local stackPriceInput
+local durationDropDown
 local summaryText
 local postButton
 local selectedDuration = 24
@@ -159,7 +160,6 @@ local function PlaceHeaderRegion(region, cfg, point)
   if not region or not headerPanel then
     return
   end
-  region:SetParent(headerPanel)
   region:ClearAllPoints()
   region:SetPoint(point or "TOPLEFT", headerPanel, "TOPLEFT", cfg.x or 0, cfg.y or 0)
   if cfg.width then
@@ -188,7 +188,6 @@ local function PlaceMessageFrame(region)
     return
   end
   local cfg = HEADER_LAYOUT.message
-  region:SetParent(headerPanel)
   region:ClearAllPoints()
   region:SetHeight(cfg.height or 18)
   region:SetJustifyH("CENTER")
@@ -331,53 +330,6 @@ local function Say(message)
   end
 end
 
-local OriginalGetAuctionItemInfo = _G.GetAuctionItemInfo
-
-local function GetOwnedAuctionItemInfo(index)
-  if not (C_AuctionHouse and C_AuctionHouse.GetOwnedAuctionInfo) then
-    return nil
-  end
-  local ok, info = pcall(C_AuctionHouse.GetOwnedAuctionInfo, index)
-  if not ok or not info then
-    return nil
-  end
-
-  local link = info.itemLink
-  local itemID = info.itemKey and info.itemKey.itemID
-  if not link and itemID then
-    link = "item:" .. itemID
-  end
-  if not link then
-    return nil
-  end
-
-  local name, _, quality, itemLevel, _, _, _, _, _, texture = GetItemInfo(link)
-  if not name then
-    return nil
-  end
-
-  local count = info.quantity or 0
-  if count <= 0 then
-    return nil
-  end
-
-  local bid = info.bidAmount or 0
-  local buyout = info.buyoutAmount or bid
-  return name, texture, count, quality, true, itemLevel or 0, bid, 0, buyout, bid, info.bidder,
-    info.owner or UnitName("player"), nil
-end
-
-if OriginalGetAuctionItemInfo then
-  _G.GetAuctionItemInfo = function(listType, index)
-    local name, texture, count, quality, canUse, level, minBid, minIncrement, buyoutPrice, bidAmount, highBidder, owner =
-      OriginalGetAuctionItemInfo(listType, index)
-    if name ~= nil or listType ~= "owner" then
-      return name, texture, count, quality, canUse, level, minBid, minIncrement, buyoutPrice, bidAmount, highBidder, owner
-    end
-    return GetOwnedAuctionItemInfo(index)
-  end
-end
-
 local function After(delay, func)
   if C_Timer and C_Timer.After then
     C_Timer.After(delay, func)
@@ -503,10 +455,35 @@ local function GetDeposit(entry, quantity)
   return total
 end
 
-local function RefreshOwnedAuctions()
-  if C_AuctionHouse and C_AuctionHouse.QueryOwnedAuctions then
-    pcall(C_AuctionHouse.QueryOwnedAuctions, {})
+local function IsAuctionThrottleReady()
+  if C_AuctionHouse and C_AuctionHouse.IsThrottledMessageSystemReady then
+    local ok, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
+    if ok then
+      return ready and true or false
+    end
   end
+  return true
+end
+
+local ownedRefreshScheduled = false
+
+local function RefreshOwnedAuctions()
+  if not (C_AuctionHouse and C_AuctionHouse.QueryOwnedAuctions) then
+    return
+  end
+  if not IsAuctionThrottleReady() then
+    if not ownedRefreshScheduled then
+      ownedRefreshScheduled = true
+      After(0.5, function()
+        ownedRefreshScheduled = false
+        RefreshOwnedAuctions()
+      end)
+    end
+    return
+  end
+
+  pcall(C_AuctionHouse.QueryOwnedAuctions, {})
+
   local function update()
     if Atr_OnAuctionOwnedUpdate then
       pcall(Atr_OnAuctionOwnedUpdate)
@@ -574,6 +551,20 @@ local function SetSelectedRows(rows)
   end
 end
 
+local function IsOwnAuctionResult(result)
+  if not result then
+    return false
+  end
+  if result.owner == "player" then
+    return true
+  end
+  local owners = result.owners
+  if type(owners) == "table" and #owners == 1 and owners[1] == "player" then
+    return true
+  end
+  return false
+end
+
 local function ProcessItemResults(itemKey)
   if not selectedEntry or not selectedEntry.itemKey or not itemKey then
     return
@@ -597,7 +588,7 @@ local function ProcessItemResults(itemKey)
     if ok2 and result then
       local quantity = result.quantity or 0
       local buyout = result.buyoutAmount or result.bidAmount or 0
-      if quantity > 0 and buyout > 0 then
+      if quantity > 0 and buyout > 0 and not IsOwnAuctionResult(result) then
         rows[#rows + 1] = {
           unitPrice = math.floor(buyout / quantity),
           quantity = quantity,
@@ -630,7 +621,7 @@ local function ProcessCommodityResults(itemID)
     if ok2 and result then
       local quantity = result.quantity or 0
       local unitPrice = result.unitPrice or 0
-      if quantity > 0 and unitPrice > 0 then
+      if quantity > 0 and unitPrice > 0 and not IsOwnAuctionResult(result) then
         rows[#rows + 1] = {
           unitPrice = unitPrice,
           quantity = quantity,
@@ -643,13 +634,10 @@ local function ProcessCommodityResults(itemID)
   SetSelectedRows(rows)
 end
 
-local function SendSearch(entry)
-  if not entry or not entry.itemKey then
-    return
-  end
+local pendingSearchEntry
+local searchRetryScheduled = false
 
-  selectedRows = {}
-
+local function SendSearchNow(entry)
   if IsCommodity(entry) then
     local sortingOrder = { sortOrder = 0, reverseSort = false }
     pcall(C_AuctionHouse.SendSearchQuery, entry.itemKey, { sortingOrder }, true)
@@ -657,6 +645,33 @@ local function SendSearch(entry)
     local sortingOrder = { sortOrder = 4, reverseSort = false }
     pcall(C_AuctionHouse.SendSellSearchQuery, entry.itemKey, { sortingOrder }, true)
   end
+end
+
+local function TrySendSearch()
+  searchRetryScheduled = false
+  local entry = pendingSearchEntry
+  if not entry then
+    return
+  end
+  if not IsAuctionThrottleReady() then
+    if not searchRetryScheduled then
+      searchRetryScheduled = true
+      After(0.3, TrySendSearch)
+    end
+    return
+  end
+  pendingSearchEntry = nil
+  SendSearchNow(entry)
+end
+
+local function SendSearch(entry)
+  if not entry or not entry.itemKey then
+    return
+  end
+
+  selectedRows = {}
+  pendingSearchEntry = entry
+  TrySendSearch()
 end
 
 local function UpdateCard()
@@ -819,16 +834,6 @@ local function PostSelected()
     return
   end
 
-  local function IsReadyToPost()
-    if C_AuctionHouse.IsThrottledMessageSystemReady then
-      local ok, ready = pcall(C_AuctionHouse.IsThrottledMessageSystemReady)
-      if ok then
-        return ready and true or false
-      end
-    end
-    return true
-  end
-
   local function GetAvailable(info)
     local count = info.count or 0
     if C_AuctionHouse.GetAvailablePostCount then
@@ -874,7 +879,7 @@ local function PostSelected()
       Finish()
       return
     end
-    if not IsReadyToPost() then
+    if not IsAuctionThrottleReady() then
       After(0.25, PostNext)
       return
     end
@@ -984,7 +989,14 @@ local function GetQualityColor(quality)
   return 1, 1, 1
 end
 
-local function ScanBags(allowUnvalidated)
+local function GetItemIDFromLink(link)
+  if type(link) ~= "string" then
+    return nil
+  end
+  return tonumber(link:match("item:(%d+)"))
+end
+
+local function ScanBags()
   local groups = {}
   local groupByClass = {}
   local blacklist = GetBlacklist()
@@ -995,7 +1007,6 @@ local function ScanBags(allowUnvalidated)
     items = {},
   }
   groups.blacklist = blacklistGroup
-  local itemCount = 0
 
   for bag = 0, (NUM_BAG_SLOTS or 4) do
     local slots = GetBagSlots(bag)
@@ -1007,7 +1018,7 @@ local function ScanBags(allowUnvalidated)
           location = ItemLocation:CreateFromBagAndSlot(bag, slot)
         end)
         local valid = location and location:IsValid()
-        local sellable = allowUnvalidated or locked
+        local sellable = locked
         if not sellable and valid then
           local ok, result = pcall(C_AuctionHouse.IsSellItemValid, location, false)
           sellable = ok and result
@@ -1097,7 +1108,6 @@ local function ScanBags(allowUnvalidated)
               end
             end
             group.items[#group.items + 1] = entry
-            itemCount = itemCount + 1
           end
         end
       end
@@ -1123,16 +1133,13 @@ local function ScanBags(allowUnvalidated)
     return left.order < right.order
   end)
 
-  if itemCount == 0 and not allowUnvalidated then
-    return ScanBags(true)
-  end
-
   return result, groupByClass
 end
 
 local function ClearSelection()
   selectedEntry = nil
   selectedRows = {}
+  pendingSearchEntry = nil
   UpdateCard()
 end
 
