@@ -5,7 +5,7 @@ local BAG_COLUMNS = 5
 local ICON_STEP = BAG_ICON_SIZE + BAG_ICON_GAP
 
 local HEADER_LAYOUT = {
-  icon = { x = 15, y = -30, size = 50 },
+  icon = { x = 15, y = -32, size = 50 },
   name = { x = 15, y = -6, width = 400, height = 18 },
   -- Перетащите в данную область предмет...
   message = { x = -140, y = 20, width = 520, height = 18 },
