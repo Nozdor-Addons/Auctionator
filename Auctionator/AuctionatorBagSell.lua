@@ -154,6 +154,7 @@ local showElemsHookInstalled = false
 local updateUIHookInstalled = false
 local paneHookInstalled = false
 local searchCompleteHookInstalled = false
+local cancelHookInstalled = false
 
 local function GetContentBase()
   return _G.AuctionHouseFrame or _G.Atr_Main_Panel or _G.Atr_SellControls or UIParent
@@ -504,34 +505,31 @@ local function RefreshOwnedAuctions()
   After(3.0, update)
 end
 
-local sellRefreshPending = false
-
-local function RefreshSellPriceList(entry)
-  if not entry then
-    return
-  end
-  if not (Atr_GetCurrentPane and Atr_IsTabSelected and Atr_IsTabSelected(SELL_TAB_INDEX)) then
+local function CancelAuctionByID(auctionID)
+  if not auctionID then
     return
   end
   if not IsAuctionThrottleReady() then
-    if not sellRefreshPending then
-      sellRefreshPending = true
-      After(0.3, function()
-        sellRefreshPending = false
-        RefreshSellPriceList(entry)
-      end)
-    end
+    After(0.3, function()
+      CancelAuctionByID(auctionID)
+    end)
     return
   end
+  pcall(C_AuctionHouse.CancelAuction, auctionID)
+end
 
-  local pane = Atr_GetCurrentPane()
-  if not pane or not pane.DoSearch then
+local function RecordPostedAuction(entry, count, unitPrice)
+  if not (entry and entry.name and count and count > 0) then
     return
   end
-
-  local name = pane.activeScan and pane.activeScan.itemName or entry.name
-  if name and name ~= "" then
-    pane:DoSearch(name, true, 0)
+  if not (Atr_IsTabSelected and Atr_IsTabSelected(SELL_TAB_INDEX)) then
+    return
+  end
+  if Atr_AddToScan then
+    pcall(Atr_AddToScan, entry.name, count, unitPrice * count, 1)
+  end
+  if Atr_AddHistoricalPrice and entry.link then
+    pcall(Atr_AddHistoricalPrice, entry.name, unitPrice, count, entry.link)
   end
 end
 
@@ -922,7 +920,7 @@ local function PostSelected()
       if Atr_BagSell_Refresh then
         Atr_BagSell_Refresh()
       end
-      RefreshSellPriceList(entryAtStart)
+      RefreshOwnedAuctions()
     end)
   end
 
@@ -960,6 +958,7 @@ local function PostSelected()
             Say(L.postError .. ": " .. tostring(err))
             return
           end
+          RecordPostedAuction(entryAtStart, count, unitPrice)
           remaining = remaining - count
           if remaining <= 0 then
             Finish()
@@ -990,6 +989,7 @@ local function PostSelected()
           Say(L.postError .. ": " .. tostring(err))
           return
         end
+        RecordPostedAuction(entryAtStart, postCount, unitPrice)
         remaining = remaining - postCount
         info.count = (info.count or 0) - postCount
         if info.count <= 0 then
@@ -1754,6 +1754,22 @@ local function EnsureFrames()
             pcall(scan.CondenseAndSort, scan)
           end
           pane.UINeedsUpdate = true
+        end
+      end)
+    end)
+  end
+
+  if Atr_CancelAuction and not cancelHookInstalled then
+    cancelHookInstalled = true
+    pcall(function()
+      hooksecurefunc("Atr_CancelAuction", function(index)
+        if not (C_AuctionHouse and C_AuctionHouse.GetOwnedAuctionInfo and
+                C_AuctionHouse.CancelAuction) then
+          return
+        end
+        local ok, info = pcall(C_AuctionHouse.GetOwnedAuctionInfo, index)
+        if ok and info and info.auctionID then
+          CancelAuctionByID(info.auctionID)
         end
       end)
     end)
